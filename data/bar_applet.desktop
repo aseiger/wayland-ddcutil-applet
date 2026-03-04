@@ -1,0 +1,4 @@
+[Plugin]
+Type=lxpanel
+Name=Display Settings
+Comment=Adjust screen brightness and audio volume
