@@ -12,6 +12,12 @@
 
 #include <widget.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 extern "C" {
 #include <lxutils.h>
 }
@@ -36,9 +42,14 @@ class BarAppletWidget : public WayfireWidget
 
     int            last_brightness = -1;
     int            last_volume = -1;
-    guint          poll_timer_id = 0;
 
-    static constexpr guint POLL_INTERVAL_MS = 1000;
+    std::thread             poll_thread;
+    std::atomic<bool>       poll_stop{false};
+    std::mutex              poll_mutex;       /* guards poll_cv wait     */
+    std::condition_variable poll_cv;
+    std::mutex              io_mutex;         /* serializes DDC/CI access */
+
+    static constexpr int POLL_INTERVAL_MS = 1000;
 
     /* -------------------------------------------------------------- */
     /*  Build the popup window (plain GtkWindow, not a popover)       */
@@ -111,7 +122,10 @@ class BarAppletWidget : public WayfireWidget
     {
         auto *self = static_cast<BarAppletWidget *>(data);
         int val = (int)gtk_range_get_value(GTK_RANGE(self->brightness_scale));
-        brightness_set(val);
+        {
+            std::lock_guard<std::mutex> lk(self->io_mutex);
+            brightness_set(val);
+        }
         lcdstats_send_brightness(val);
         self->last_brightness = val;
         return FALSE;
@@ -122,36 +136,73 @@ class BarAppletWidget : public WayfireWidget
     {
         auto *self = static_cast<BarAppletWidget *>(data);
         int val = (int)gtk_range_get_value(GTK_RANGE(self->volume_scale));
-        volume_set(val);
+        {
+            std::lock_guard<std::mutex> lk(self->io_mutex);
+            volume_set(val);
+        }
         lcdstats_send_volume(val);
         self->last_volume = val;
         return FALSE;
     }
 
-    /* Poll the display state at a slow cadence and mirror changes */
-    static gboolean poll_display_state_cb(gpointer data)
+    /* Result of one polling cycle, applied on the GTK main thread */
+    struct PollResult
     {
-        auto *self = static_cast<BarAppletWidget *>(data);
+        BarAppletWidget *self;
+        int              brightness;   /* -1 == unchanged */
+        int              volume;       /* -1 == unchanged */
+    };
 
-        int br = brightness_get();
-        if (br >= 0 && br != self->last_brightness)
+    /* Apply mirrored changes on the main loop (UI + lcdstats) */
+    static gboolean apply_poll_result_cb(gpointer data)
+    {
+        auto *r = static_cast<PollResult *>(data);
+        auto *self = r->self;
+
+        if (r->brightness >= 0)
         {
-            self->last_brightness = br;
-            lcdstats_send_brightness(br);
+            self->last_brightness = r->brightness;
+            lcdstats_send_brightness(r->brightness);
             if (self->popup_window && gtk_widget_get_visible(self->popup_window) && self->brightness_scale)
-                gtk_range_set_value(GTK_RANGE(self->brightness_scale), br);
+                gtk_range_set_value(GTK_RANGE(self->brightness_scale), r->brightness);
         }
 
-        int vol = volume_get();
-        if (vol >= 0 && vol != self->last_volume)
+        if (r->volume >= 0)
         {
-            self->last_volume = vol;
-            lcdstats_send_volume(vol);
+            self->last_volume = r->volume;
+            lcdstats_send_volume(r->volume);
             if (self->popup_window && gtk_widget_get_visible(self->popup_window) && self->volume_scale)
-                gtk_range_set_value(GTK_RANGE(self->volume_scale), vol);
+                gtk_range_set_value(GTK_RANGE(self->volume_scale), r->volume);
         }
 
-        return G_SOURCE_CONTINUE;
+        delete r;
+        return G_SOURCE_REMOVE;
+    }
+
+    /* Background poll loop: slow DDC/CI reads off the main thread */
+    void poll_loop()
+    {
+        while (!poll_stop)
+        {
+            int br, vol;
+            {
+                std::lock_guard<std::mutex> lk(io_mutex);
+                br  = brightness_get();
+                vol = volume_get();
+            }
+
+            int br_changed  = (br  >= 0 && br  != last_brightness) ? br  : -1;
+            int vol_changed = (vol >= 0 && vol != last_volume)     ? vol : -1;
+            if (br_changed >= 0 || vol_changed >= 0)
+            {
+                auto *r = new PollResult{this, br_changed, vol_changed};
+                g_idle_add(apply_poll_result_cb, r);
+            }
+
+            std::unique_lock<std::mutex> lk(poll_mutex);
+            poll_cv.wait_for(lk, std::chrono::milliseconds(POLL_INTERVAL_MS),
+                             [this] { return poll_stop.load(); });
+        }
     }
 
     /* Click handler for the panel button */
@@ -167,14 +218,18 @@ class BarAppletWidget : public WayfireWidget
         build_popup();
 
         /* Refresh current values from the display */
-        int br = brightness_get();
+        int br, vol;
+        {
+            std::lock_guard<std::mutex> lk(io_mutex);
+            br  = brightness_get();
+            vol = volume_get();
+        }
         if (br >= 0)
         {
             gtk_range_set_value(GTK_RANGE(brightness_scale), br);
             last_brightness = br;
         }
 
-        int vol = volume_get();
         if (vol >= 0)
         {
             gtk_range_set_value(GTK_RANGE(volume_scale), vol);
@@ -216,15 +271,18 @@ class BarAppletWidget : public WayfireWidget
         last_brightness = brightness_get();
         last_volume = volume_get();
 
-        /* Poll at ~1Hz so external DDC/CI changes are mirrored to lcdstats
-         * and the popup sliders without hammering the I2C bus. */
-        poll_timer_id = g_timeout_add(POLL_INTERVAL_MS, poll_display_state_cb, this);
+        /* Poll at ~1Hz on a worker thread so the slow DDC/CI reads never
+         * block the GTK main loop. External changes are mirrored to
+         * lcdstats and the popup sliders without hammering the I2C bus. */
+        poll_thread = std::thread(&BarAppletWidget::poll_loop, this);
     }
 
     ~BarAppletWidget() override
     {
-        if (poll_timer_id)
-            g_source_remove(poll_timer_id);
+        poll_stop = true;
+        poll_cv.notify_all();
+        if (poll_thread.joinable())
+            poll_thread.join();
         lcdstats_close();
         if (popup_window)
             gtk_widget_destroy(popup_window);
