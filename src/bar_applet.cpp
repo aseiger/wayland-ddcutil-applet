@@ -34,6 +34,12 @@ class BarAppletWidget : public WayfireWidget
     GtkWidget     *brightness_scale = nullptr;
     GtkWidget     *volume_scale = nullptr;
 
+    int            last_brightness = -1;
+    int            last_volume = -1;
+    guint          poll_timer_id = 0;
+
+    static constexpr guint POLL_INTERVAL_MS = 1000;
+
     /* -------------------------------------------------------------- */
     /*  Build the popup window (plain GtkWindow, not a popover)       */
     /* -------------------------------------------------------------- */
@@ -107,6 +113,7 @@ class BarAppletWidget : public WayfireWidget
         int val = (int)gtk_range_get_value(GTK_RANGE(self->brightness_scale));
         brightness_set(val);
         lcdstats_send_brightness(val);
+        self->last_brightness = val;
         return FALSE;
     }
 
@@ -117,7 +124,34 @@ class BarAppletWidget : public WayfireWidget
         int val = (int)gtk_range_get_value(GTK_RANGE(self->volume_scale));
         volume_set(val);
         lcdstats_send_volume(val);
+        self->last_volume = val;
         return FALSE;
+    }
+
+    /* Poll the display state at a slow cadence and mirror changes */
+    static gboolean poll_display_state_cb(gpointer data)
+    {
+        auto *self = static_cast<BarAppletWidget *>(data);
+
+        int br = brightness_get();
+        if (br >= 0 && br != self->last_brightness)
+        {
+            self->last_brightness = br;
+            lcdstats_send_brightness(br);
+            if (self->popup_window && gtk_widget_get_visible(self->popup_window) && self->brightness_scale)
+                gtk_range_set_value(GTK_RANGE(self->brightness_scale), br);
+        }
+
+        int vol = volume_get();
+        if (vol >= 0 && vol != self->last_volume)
+        {
+            self->last_volume = vol;
+            lcdstats_send_volume(vol);
+            if (self->popup_window && gtk_widget_get_visible(self->popup_window) && self->volume_scale)
+                gtk_range_set_value(GTK_RANGE(self->volume_scale), vol);
+        }
+
+        return G_SOURCE_CONTINUE;
     }
 
     /* Click handler for the panel button */
@@ -135,11 +169,17 @@ class BarAppletWidget : public WayfireWidget
         /* Refresh current values from the display */
         int br = brightness_get();
         if (br >= 0)
+        {
             gtk_range_set_value(GTK_RANGE(brightness_scale), br);
+            last_brightness = br;
+        }
 
         int vol = volume_get();
         if (vol >= 0)
+        {
             gtk_range_set_value(GTK_RANGE(volume_scale), vol);
+            last_volume = vol;
+        }
 
         /* Use the wf-panel-pi framework popup helper — this handles
          * positioning, layer-shell, and auto-dismiss on click-outside. */
@@ -172,10 +212,19 @@ class BarAppletWidget : public WayfireWidget
         /* Connect to lcdstats daemon — current brightness & volume
          * are sent automatically on connect (and on any reconnect). */
         lcdstats_init();
+
+        last_brightness = brightness_get();
+        last_volume = volume_get();
+
+        /* Poll at ~1Hz so external DDC/CI changes are mirrored to lcdstats
+         * and the popup sliders without hammering the I2C bus. */
+        poll_timer_id = g_timeout_add(POLL_INTERVAL_MS, poll_display_state_cb, this);
     }
 
     ~BarAppletWidget() override
     {
+        if (poll_timer_id)
+            g_source_remove(poll_timer_id);
         lcdstats_close();
         if (popup_window)
             gtk_widget_destroy(popup_window);
